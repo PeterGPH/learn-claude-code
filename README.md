@@ -1,5 +1,18 @@
 [English](./README.md) | [中文](./README-zh.md) | [日本語](./README-ja.md)  
 # Learn Claude Code -- A nano Claude Code-like agent, built from 0 to 1
+
+## Attribution
+
+This project is a modified fork/adaptation of
+[shareAI-lab/learn-claude-code](https://github.com/shareAI-lab/learn-claude-code).
+
+I extended it with:
+- local Ollama + `qwen3-coder:30b` workflow
+- provider compatibility updates across `agents/*`
+- `s13_personal_time_management.py` (daily todo/progress/summary flow)
+
+Original project credit goes to the Learn Claude Code authors.
+
 <img width="260" src="https://github.com/user-attachments/assets/fe8b852b-97da-4061-a467-9694906b5edf" /><br>
 
 Scan with Wechat to fellow us,  
