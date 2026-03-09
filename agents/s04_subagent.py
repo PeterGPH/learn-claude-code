@@ -23,13 +23,15 @@ Key insight: "Process isolation gives context isolation for free."
 """
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
-from anthropic import Anthropic
+from anthropic import APIConnectionError, Anthropic, AnthropicError, BadRequestError
 from dotenv import load_dotenv
 
-load_dotenv(override=True)
+# Keep shell-exported vars authoritative; only fill missing values from .env.
+load_dotenv(override=False)
 
 if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
@@ -49,6 +51,7 @@ def safe_path(p: str) -> Path:
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
+
 def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
@@ -61,6 +64,7 @@ def run_bash(command: str) -> str:
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
 
+
 def run_read(path: str, limit: int = None) -> str:
     try:
         lines = safe_path(path).read_text().splitlines()
@@ -70,6 +74,7 @@ def run_read(path: str, limit: int = None) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+
 def run_write(path: str, content: str) -> str:
     try:
         fp = safe_path(path)
@@ -78,6 +83,7 @@ def run_write(path: str, content: str) -> str:
         return f"Wrote {len(content)} bytes"
     except Exception as e:
         return f"Error: {e}"
+
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
@@ -110,29 +116,6 @@ CHILD_TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
 ]
 
-
-# -- Subagent: fresh context, filtered tools, summary-only return --
-def run_subagent(prompt: str) -> str:
-    sub_messages = [{"role": "user", "content": prompt}]  # fresh context
-    for _ in range(30):  # safety limit
-        response = client.messages.create(
-            model=MODEL, system=SUBAGENT_SYSTEM, messages=sub_messages,
-            tools=CHILD_TOOLS, max_tokens=8000,
-        )
-        sub_messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
-            break
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)[:50000]})
-        sub_messages.append({"role": "user", "content": results})
-    # Only the final text returns to the parent -- child context is discarded
-    return "".join(b.text for b in response.content if hasattr(b, "text")) or "(no summary)"
-
-
 # -- Parent tools: base tools + task dispatcher --
 PARENT_TOOLS = CHILD_TOOLS + [
     {"name": "task", "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
@@ -140,28 +123,170 @@ PARENT_TOOLS = CHILD_TOOLS + [
 ]
 
 
+def call_messages_api(system: str, messages: list, tools: list):
+    try:
+        return client.messages.create(
+            model=MODEL, system=system, messages=messages,
+            tools=tools, max_tokens=8000,
+        )
+    except BadRequestError as e:
+        msg = str(e)
+        print(f"\033[31mBad request to Anthropic-compatible API:\033[0m {msg}")
+        if "model" in msg.lower() and "not found" in msg.lower():
+            base_url = os.getenv("ANTHROPIC_BASE_URL") or "https://api.anthropic.com"
+            print(f"Configured MODEL_ID={MODEL}")
+            print(f"Configured ANTHROPIC_BASE_URL={base_url}")
+            print("For Ollama, set MODEL_ID to an installed local tag, e.g. qwen3-coder:30b")
+        return None
+    except APIConnectionError as e:
+        print(f"\033[31mNetwork/API connection error:\033[0m {e}")
+        return None
+    except AnthropicError as e:
+        print(f"\033[31mAnthropic API error:\033[0m {e}")
+        return None
+
+
+def extract_text_tool_calls(content_blocks):
+    """
+    Fallback parser for models that emit pseudo tool calls as plain text, e.g.:
+    <function=read_file><parameter=path>requirements.txt</parameter></function></tool_call>
+    """
+    texts = []
+    for block in content_blocks:
+        if hasattr(block, "type") and block.type == "text" and hasattr(block, "text"):
+            texts.append(block.text)
+    joined = "\n".join(texts)
+    calls = []
+    call_pattern = re.compile(
+        r"<function=([a-zA-Z0-9_]+)>\s*(.*?)\s*</function>\s*</tool_call>",
+        re.IGNORECASE | re.DOTALL,
+    )
+    param_pattern = re.compile(
+        r"<parameter=([a-zA-Z0-9_]+)>\s*(.*?)\s*</parameter>",
+        re.IGNORECASE | re.DOTALL,
+    )
+    for name, body in call_pattern.findall(joined):
+        args = {}
+        for key, value in param_pattern.findall(body):
+            raw = value.strip()
+            args[key] = int(raw) if key == "limit" and raw.isdigit() else raw
+        calls.append((name, args))
+    return calls
+
+
+def execute_base_tool(name: str, args: dict):
+    handler = TOOL_HANDLERS.get(name)
+    if not handler:
+        return f"Unknown tool: {name}"
+    try:
+        return handler(**args)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# -- Subagent: fresh context, filtered tools, summary-only return --
+def run_subagent(prompt: str) -> str:
+    sub_messages = [{"role": "user", "content": prompt}]  # fresh context
+    final_text = "(no summary)"
+    for _ in range(30):  # safety limit
+        response = call_messages_api(SUBAGENT_SYSTEM, sub_messages, CHILD_TOOLS)
+        if response is None:
+            return "(subagent error)"
+
+        sub_messages.append({"role": "assistant", "content": response.content})
+        text = "".join(b.text for b in response.content if hasattr(b, "text")).strip()
+        if text:
+            final_text = text
+
+        if response.stop_reason == "tool_use":
+            results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    output = execute_base_tool(block.name, block.input)
+                    results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": str(output)[:50000],
+                    })
+            sub_messages.append({"role": "user", "content": results})
+            continue
+
+        # Fallback for models that return text-style function calls.
+        text_calls = extract_text_tool_calls(response.content)
+        if not text_calls:
+            break
+
+        feedback_lines = []
+        for name, args in text_calls:
+            output = execute_base_tool(name, args)
+            args_preview = ", ".join(f"{k}={v!r}" for k, v in args.items())
+            feedback_lines.append(f"{name}({args_preview}) -> {output}")
+
+        sub_messages.append({
+            "role": "user",
+            "content": (
+                "Tool execution results:\n\n"
+                + "\n\n".join(feedback_lines)
+                + "\n\nIf finished, provide a concise summary. "
+                "If more actions are needed, emit another function call."
+            ),
+        })
+
+    # Only the final text returns to the parent -- child context is discarded
+    return final_text
+
+
 def agent_loop(messages: list):
     while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=PARENT_TOOLS, max_tokens=8000,
-        )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        response = call_messages_api(SYSTEM, messages, PARENT_TOOLS)
+        if response is None:
             return
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                if block.name == "task":
-                    desc = block.input.get("description", "subtask")
-                    print(f"> task ({desc}): {block.input['prompt'][:80]}")
-                    output = run_subagent(block.input["prompt"])
-                else:
-                    handler = TOOL_HANDLERS.get(block.name)
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                print(f"  {str(output)[:200]}")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
-        messages.append({"role": "user", "content": results})
+
+        messages.append({"role": "assistant", "content": response.content})
+
+        if response.stop_reason == "tool_use":
+            results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    if block.name == "task":
+                        desc = block.input.get("description", "subtask")
+                        prompt = block.input.get("prompt", "")
+                        print(f"> task ({desc}): {prompt[:80]}")
+                        output = run_subagent(prompt) if prompt else "Error: missing prompt"
+                    else:
+                        output = execute_base_tool(block.name, block.input)
+                    print(f"  {str(output)[:200]}")
+                    results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+            messages.append({"role": "user", "content": results})
+            continue
+
+        # Fallback for models that return text-style function calls.
+        text_calls = extract_text_tool_calls(response.content)
+        if not text_calls:
+            return
+
+        feedback_lines = []
+        for name, args in text_calls:
+            if name == "task":
+                desc = args.get("description", "subtask")
+                prompt = args.get("prompt", "")
+                print(f"> task ({desc}): {str(prompt)[:80]}")
+                output = run_subagent(prompt) if prompt else "Error: missing prompt"
+            else:
+                output = execute_base_tool(name, args)
+            print(f"  {str(output)[:200]}")
+            args_preview = ", ".join(f"{k}={v!r}" for k, v in args.items())
+            feedback_lines.append(f"{name}({args_preview}) -> {output}")
+
+        messages.append({
+            "role": "user",
+            "content": (
+                "Tool execution results:\n\n"
+                + "\n\n".join(feedback_lines)
+                + "\n\nIf finished, provide a concise final answer. "
+                "If more actions are needed, emit another function call."
+            ),
+        })
 
 
 if __name__ == "__main__":

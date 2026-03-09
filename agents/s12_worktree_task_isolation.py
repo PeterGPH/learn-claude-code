@@ -36,10 +36,11 @@ import subprocess
 import time
 from pathlib import Path
 
-from anthropic import Anthropic
+from anthropic import APIConnectionError, Anthropic, AnthropicError, BadRequestError
 from dotenv import load_dotenv
 
-load_dotenv(override=True)
+# Keep shell-exported vars authoritative; only fill missing values from .env.
+load_dotenv(override=False)
 
 if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
@@ -725,36 +726,123 @@ TOOLS = [
 ]
 
 
-def agent_loop(messages: list):
-    while True:
-        response = client.messages.create(
+def _coerce_param(name: str, raw: str):
+    value = raw.strip()
+    if name in ("task_id", "limit") and value.isdigit():
+        return int(value)
+    if name in ("force", "complete_task"):
+        low = value.lower()
+        if low in ("true", "1", "yes", "y", "on"):
+            return True
+        if low in ("false", "0", "no", "n", "off"):
+            return False
+    return value
+
+
+def extract_text_tool_calls(content_blocks):
+    """
+    Fallback parser for models that emit pseudo tool calls as plain text, e.g.:
+    <function=worktree_status><parameter=name>lane-a</parameter></function></tool_call>
+    """
+    texts = []
+    for block in content_blocks:
+        if hasattr(block, "type") and block.type == "text" and hasattr(block, "text"):
+            texts.append(block.text)
+    joined = "\n".join(texts)
+    calls = []
+    call_pattern = re.compile(
+        r"<function=([a-zA-Z0-9_]+)>\s*(.*?)\s*</function>\s*</tool_call>",
+        re.IGNORECASE | re.DOTALL,
+    )
+    param_pattern = re.compile(
+        r"<parameter=([a-zA-Z0-9_]+)>\s*(.*?)\s*</parameter>",
+        re.IGNORECASE | re.DOTALL,
+    )
+    for name, body in call_pattern.findall(joined):
+        args = {}
+        for key, value in param_pattern.findall(body):
+            args[key] = _coerce_param(key, value)
+        calls.append((name, args))
+    return calls
+
+
+def call_messages_api(messages: list):
+    try:
+        return client.messages.create(
             model=MODEL,
             system=SYSTEM,
             messages=messages,
             tools=TOOLS,
             max_tokens=8000,
         )
+    except BadRequestError as e:
+        msg = str(e)
+        print(f"\033[31mBad request to Anthropic-compatible API:\033[0m {msg}")
+        if "model" in msg.lower() and "not found" in msg.lower():
+            base_url = os.getenv("ANTHROPIC_BASE_URL") or "https://api.anthropic.com"
+            print(f"Configured MODEL_ID={MODEL}")
+            print(f"Configured ANTHROPIC_BASE_URL={base_url}")
+            print("For Ollama, set MODEL_ID to an installed local tag, e.g. qwen3-coder:30b")
+        return None
+    except APIConnectionError as e:
+        print(f"\033[31mNetwork/API connection error:\033[0m {e}")
+        return None
+    except AnthropicError as e:
+        print(f"\033[31mAnthropic API error:\033[0m {e}")
+        return None
+
+
+def agent_loop(messages: list):
+    while True:
+        response = call_messages_api(messages)
+        if response is None:
+            return
         messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        if response.stop_reason == "tool_use":
+            results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    handler = TOOL_HANDLERS.get(block.name)
+                    try:
+                        output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                    except Exception as e:
+                        output = f"Error: {e}"
+                    print(f"> {block.name}: {str(output)[:200]}")
+                    results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": str(output),
+                        }
+                    )
+            messages.append({"role": "user", "content": results})
+            continue
+
+        # Fallback for models that return text-style function calls.
+        text_calls = extract_text_tool_calls(response.content)
+        if not text_calls:
             return
 
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                try:
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                except Exception as e:
-                    output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
-                results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": str(output),
-                    }
-                )
-        messages.append({"role": "user", "content": results})
+        feedback_lines = []
+        for tool_name, args in text_calls:
+            handler = TOOL_HANDLERS.get(tool_name)
+            try:
+                output = handler(**args) if handler else f"Unknown tool: {tool_name}"
+            except Exception as e:
+                output = f"Error: {e}"
+            print(f"> {tool_name}: {str(output)[:200]}")
+            args_preview = ", ".join(f"{k}={v!r}" for k, v in args.items())
+            feedback_lines.append(f"{tool_name}({args_preview}) -> {output}")
+
+        messages.append({
+            "role": "user",
+            "content": (
+                "Tool execution results:\n\n"
+                + "\n\n".join(feedback_lines)
+                + "\n\nIf finished, provide a concise final answer. "
+                "If more actions are needed, emit another function call."
+            ),
+        })
 
 
 if __name__ == "__main__":

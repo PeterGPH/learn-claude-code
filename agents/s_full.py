@@ -38,6 +38,7 @@ NOT a teaching session -- this is the "put it all together" reference.
 import json
 import os
 import re
+import ast
 import subprocess
 import threading
 import time
@@ -45,10 +46,11 @@ import uuid
 from pathlib import Path
 from queue import Queue
 
-from anthropic import Anthropic
+from anthropic import APIConnectionError, Anthropic, AnthropicError, BadRequestError
 from dotenv import load_dotenv
 
-load_dotenv(override=True)
+# Keep shell-exported vars authoritative; only fill missing values from .env.
+load_dotenv(override=False)
 if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
@@ -118,6 +120,94 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
+def _coerce_param(name: str, raw: str):
+    value = raw.strip()
+    if name in ("task_id", "limit", "timeout") and value.isdigit():
+        return int(value)
+    if name in ("approve", "force", "complete_task"):
+        low = value.lower()
+        if low in ("true", "1", "yes", "y", "on"):
+            return True
+        if low in ("false", "0", "no", "n", "off"):
+            return False
+    if name in ("add_blocked_by", "add_blocks"):
+        for parser in (json.loads, ast.literal_eval):
+            try:
+                parsed = parser(value)
+                if isinstance(parsed, list):
+                    return [int(x) for x in parsed]
+            except Exception:
+                pass
+        return [int(x.strip()) for x in value.split(",") if x.strip()]
+    if name == "items":
+        for parser in (json.loads, ast.literal_eval):
+            try:
+                parsed = parser(value)
+                if isinstance(parsed, list):
+                    return parsed
+            except Exception:
+                pass
+    return value
+
+
+def extract_text_tool_calls(content_blocks):
+    """
+    Fallback parser for models that emit pseudo tool calls as plain text.
+    """
+    texts = []
+    for block in content_blocks:
+        if hasattr(block, "type") and block.type == "text" and hasattr(block, "text"):
+            texts.append(block.text)
+    joined = "\n".join(texts)
+    calls = []
+    call_pattern = re.compile(
+        r"<function=([a-zA-Z0-9_]+)>\s*(.*?)\s*</function>\s*</tool_call>",
+        re.IGNORECASE | re.DOTALL,
+    )
+    param_pattern = re.compile(
+        r"<parameter=([a-zA-Z0-9_]+)>\s*(.*?)\s*</parameter>",
+        re.IGNORECASE | re.DOTALL,
+    )
+    for name, body in call_pattern.findall(joined):
+        args = {}
+        for key, value in param_pattern.findall(body):
+            args[key] = _coerce_param(key, value)
+        calls.append((name, args))
+    return calls
+
+
+def call_messages_api(
+    messages: list,
+    *,
+    system: str | None = None,
+    tools: list | None = None,
+    max_tokens: int = 8000,
+    actor: str = "agent",
+):
+    kwargs = {"model": MODEL, "messages": messages, "max_tokens": max_tokens}
+    if system is not None:
+        kwargs["system"] = system
+    if tools is not None:
+        kwargs["tools"] = tools
+    try:
+        return client.messages.create(**kwargs)
+    except BadRequestError as e:
+        msg = str(e)
+        print(f"\033[31m[{actor}] Bad request to Anthropic-compatible API:\033[0m {msg}")
+        if "model" in msg.lower() and "not found" in msg.lower():
+            base_url = os.getenv("ANTHROPIC_BASE_URL") or "https://api.anthropic.com"
+            print(f"Configured MODEL_ID={MODEL}")
+            print(f"Configured ANTHROPIC_BASE_URL={base_url}")
+            print("For Ollama, set MODEL_ID to an installed local tag, e.g. qwen3-coder:30b")
+        return None
+    except APIConnectionError as e:
+        print(f"\033[31m[{actor}] Network/API connection error:\033[0m {e}")
+        return None
+    except AnthropicError as e:
+        print(f"\033[31m[{actor}] Anthropic API error:\033[0m {e}")
+        return None
+
+
 # === SECTION: todos (s03) ===
 class TodoManager:
     def __init__(self):
@@ -177,21 +267,57 @@ def run_subagent(prompt: str, agent_type: str = "Explore") -> str:
         "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
     }
     sub_msgs = [{"role": "user", "content": prompt}]
-    resp = None
+    final_text = "(no summary)"
     for _ in range(30):
-        resp = client.messages.create(model=MODEL, messages=sub_msgs, tools=sub_tools, max_tokens=8000)
+        resp = call_messages_api(
+            sub_msgs,
+            tools=sub_tools,
+            max_tokens=8000,
+            actor=f"subagent:{agent_type}",
+        )
+        if resp is None:
+            return "(subagent failed)"
         sub_msgs.append({"role": "assistant", "content": resp.content})
-        if resp.stop_reason != "tool_use":
+        text = "".join(b.text for b in resp.content if hasattr(b, "text")).strip()
+        if text:
+            final_text = text
+
+        if resp.stop_reason == "tool_use":
+            results = []
+            for b in resp.content:
+                if b.type == "tool_use":
+                    h = sub_handlers.get(b.name, lambda **kw: "Unknown tool")
+                    try:
+                        output = h(**b.input)
+                    except Exception as e:
+                        output = f"Error: {e}"
+                    results.append({"type": "tool_result", "tool_use_id": b.id, "content": str(output)[:50000]})
+            sub_msgs.append({"role": "user", "content": results})
+            continue
+
+        text_calls = extract_text_tool_calls(resp.content)
+        if not text_calls:
             break
-        results = []
-        for b in resp.content:
-            if b.type == "tool_use":
-                h = sub_handlers.get(b.name, lambda **kw: "Unknown tool")
-                results.append({"type": "tool_result", "tool_use_id": b.id, "content": str(h(**b.input))[:50000]})
-        sub_msgs.append({"role": "user", "content": results})
-    if resp:
-        return "".join(b.text for b in resp.content if hasattr(b, "text")) or "(no summary)"
-    return "(subagent failed)"
+
+        feedback_lines = []
+        for tool_name, args in text_calls:
+            h = sub_handlers.get(tool_name, lambda **kw: "Unknown tool")
+            try:
+                output = h(**args)
+            except Exception as e:
+                output = f"Error: {e}"
+            args_preview = ", ".join(f"{k}={v!r}" for k, v in args.items())
+            feedback_lines.append(f"{tool_name}({args_preview}) -> {output}")
+        sub_msgs.append({
+            "role": "user",
+            "content": (
+                "Tool execution results:\n\n"
+                + "\n\n".join(feedback_lines)
+                + "\n\nIf finished, provide a concise summary. "
+                "If more actions are needed, emit another function call."
+            ),
+        })
+    return final_text
 
 
 # === SECTION: skills (s05) ===
@@ -246,12 +372,18 @@ def auto_compact(messages: list) -> list:
         for msg in messages:
             f.write(json.dumps(msg, default=str) + "\n")
     conv_text = json.dumps(messages, default=str)[:80000]
-    resp = client.messages.create(
-        model=MODEL,
-        messages=[{"role": "user", "content": f"Summarize for continuity:\n{conv_text}"}],
+    resp = call_messages_api(
+        [{"role": "user", "content": f"Summarize for continuity:\n{conv_text}"}],
+        system="You summarize coding-agent conversations for continuity.",
+        tools=None,
         max_tokens=2000,
+        actor="auto_compact",
     )
-    summary = resp.content[0].text
+    summary = (
+        "".join(b.text for b in resp.content if hasattr(b, "text")).strip()
+        if resp is not None
+        else "Summary unavailable (API error)."
+    )
     return [
         {"role": "user", "content": f"[Compressed. Transcript: {path}]\n{summary}"},
         {"role": "assistant", "content": "Understood. Continuing with summary context."},
@@ -461,36 +593,74 @@ class TeammateManager:
                         self._set_status(name, "shutdown")
                         return
                     messages.append({"role": "user", "content": json.dumps(msg)})
-                try:
-                    response = client.messages.create(
-                        model=MODEL, system=sys_prompt, messages=messages,
-                        tools=tools, max_tokens=8000)
-                except Exception:
+                response = call_messages_api(
+                    messages,
+                    system=sys_prompt,
+                    tools=tools,
+                    max_tokens=8000,
+                    actor=f"teammate:{name}",
+                )
+                if response is None:
                     self._set_status(name, "shutdown")
                     return
                 messages.append({"role": "assistant", "content": response.content})
-                if response.stop_reason != "tool_use":
+                if response.stop_reason == "tool_use":
+                    results = []
+                    idle_requested = False
+                    for block in response.content:
+                        if block.type == "tool_use":
+                            if block.name == "idle":
+                                idle_requested = True
+                                output = "Entering idle phase."
+                            elif block.name == "claim_task":
+                                output = self.task_mgr.claim(block.input["task_id"], name)
+                            elif block.name == "send_message":
+                                output = self.bus.send(name, block.input["to"], block.input["content"])
+                            else:
+                                dispatch = {"bash": lambda **kw: run_bash(kw["command"]),
+                                            "read_file": lambda **kw: run_read(kw["path"]),
+                                            "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
+                                            "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"])}
+                                output = dispatch.get(block.name, lambda **kw: "Unknown")(**block.input)
+                            print(f"  [{name}] {block.name}: {str(output)[:120]}")
+                            results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+                    messages.append({"role": "user", "content": results})
+                    if idle_requested:
+                        break
+                    continue
+
+                text_calls = extract_text_tool_calls(response.content)
+                if not text_calls:
                     break
-                results = []
+
+                feedback_lines = []
                 idle_requested = False
-                for block in response.content:
-                    if block.type == "tool_use":
-                        if block.name == "idle":
-                            idle_requested = True
-                            output = "Entering idle phase."
-                        elif block.name == "claim_task":
-                            output = self.task_mgr.claim(block.input["task_id"], name)
-                        elif block.name == "send_message":
-                            output = self.bus.send(name, block.input["to"], block.input["content"])
-                        else:
-                            dispatch = {"bash": lambda **kw: run_bash(kw["command"]),
-                                        "read_file": lambda **kw: run_read(kw["path"]),
-                                        "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
-                                        "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"])}
-                            output = dispatch.get(block.name, lambda **kw: "Unknown")(**block.input)
-                        print(f"  [{name}] {block.name}: {str(output)[:120]}")
-                        results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
-                messages.append({"role": "user", "content": results})
+                for tool_name, args in text_calls:
+                    if tool_name == "idle":
+                        idle_requested = True
+                        output = "Entering idle phase."
+                    elif tool_name == "claim_task":
+                        output = self.task_mgr.claim(args["task_id"], name)
+                    elif tool_name == "send_message":
+                        output = self.bus.send(name, args["to"], args["content"])
+                    else:
+                        dispatch = {"bash": lambda **kw: run_bash(kw["command"]),
+                                    "read_file": lambda **kw: run_read(kw["path"]),
+                                    "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
+                                    "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"])}
+                        output = dispatch.get(tool_name, lambda **kw: "Unknown")(**args)
+                    print(f"  [{name}] {tool_name}: {str(output)[:120]}")
+                    args_preview = ", ".join(f"{k}={v!r}" for k, v in args.items())
+                    feedback_lines.append(f"{tool_name}({args_preview}) -> {output}")
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Tool execution results:\n\n"
+                        + "\n\n".join(feedback_lines)
+                        + "\n\nIf finished, provide a concise final answer. "
+                        "If more actions are needed, emit another function call."
+                    ),
+                })
                 if idle_requested:
                     break
             # -- IDLE PHASE: poll for messages and unclaimed tasks --
@@ -671,36 +841,83 @@ def agent_loop(messages: list):
             messages.append({"role": "user", "content": f"<inbox>{json.dumps(inbox, indent=2)}</inbox>"})
             messages.append({"role": "assistant", "content": "Noted inbox messages."})
         # LLM call
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
+        response = call_messages_api(
+            messages,
+            system=SYSTEM,
+            tools=TOOLS,
+            max_tokens=8000,
+            actor="lead",
         )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        if response is None:
             return
-        # Tool execution
-        results = []
+        messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason == "tool_use":
+            # Tool execution
+            results = []
+            used_todo = False
+            manual_compress = False
+            for block in response.content:
+                if block.type == "tool_use":
+                    if block.name == "compress":
+                        manual_compress = True
+                    handler = TOOL_HANDLERS.get(block.name)
+                    try:
+                        output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                    except Exception as e:
+                        output = f"Error: {e}"
+                    print(f"> {block.name}: {str(output)[:200]}")
+                    results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+                    if block.name == "TodoWrite":
+                        used_todo = True
+            # s03: nag reminder (only when todo workflow is active)
+            rounds_without_todo = 0 if used_todo else rounds_without_todo + 1
+            if TODO.has_open_items() and rounds_without_todo >= 3:
+                results.insert(0, {"type": "text", "text": "<reminder>Update your todos.</reminder>"})
+            messages.append({"role": "user", "content": results})
+            # s06: manual compress
+            if manual_compress:
+                print("[manual compact]")
+                messages[:] = auto_compact(messages)
+            continue
+
+        # Fallback for models that return text-style function calls.
+        text_calls = extract_text_tool_calls(response.content)
+        if not text_calls:
+            return
+
+        feedback_lines = []
         used_todo = False
         manual_compress = False
-        for block in response.content:
-            if block.type == "tool_use":
-                if block.name == "compress":
-                    manual_compress = True
-                handler = TOOL_HANDLERS.get(block.name)
-                try:
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                except Exception as e:
-                    output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
-                if block.name == "TodoWrite":
-                    used_todo = True
-        # s03: nag reminder (only when todo workflow is active)
+        for tool_name, args in text_calls:
+            if tool_name == "compress":
+                manual_compress = True
+            handler = TOOL_HANDLERS.get(tool_name)
+            try:
+                output = handler(**args) if handler else f"Unknown tool: {tool_name}"
+            except Exception as e:
+                output = f"Error: {e}"
+            print(f"> {tool_name}: {str(output)[:200]}")
+            args_preview = ", ".join(f"{k}={v!r}" for k, v in args.items())
+            feedback_lines.append(f"{tool_name}({args_preview}) -> {output}")
+            if tool_name == "TodoWrite":
+                used_todo = True
+
         rounds_without_todo = 0 if used_todo else rounds_without_todo + 1
-        if TODO.has_open_items() and rounds_without_todo >= 3:
-            results.insert(0, {"type": "text", "text": "<reminder>Update your todos.</reminder>"})
-        messages.append({"role": "user", "content": results})
-        # s06: manual compress
+        reminder = (
+            "\n\n<reminder>Update your todos.</reminder>"
+            if TODO.has_open_items() and rounds_without_todo >= 3
+            else ""
+        )
+        messages.append({
+            "role": "user",
+            "content": (
+                "Tool execution results:\n\n"
+                + "\n\n".join(feedback_lines)
+                + reminder
+                + "\n\nIf finished, provide a concise final answer. "
+                "If more actions are needed, emit another function call."
+            ),
+        })
         if manual_compress:
             print("[manual compact]")
             messages[:] = auto_compact(messages)
