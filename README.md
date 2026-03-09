@@ -112,6 +112,34 @@ python agents/s13_personal_time_management.py # Personal time-management workflo
 python agents/s_full.py               # Capstone: all mechanisms combined
 ```
 
+### Local Ollama + Qwen (recommended for local runs)
+
+The `agents/*.py` scripts support Anthropic-compatible local endpoints, including Ollama.
+
+```sh
+# 1) Start local model
+ollama run qwen3-coder:30b
+
+# 2) Configure environment
+cp .env.example .env
+```
+
+Set `.env` to:
+
+```env
+ANTHROPIC_BASE_URL=http://localhost:11434/v1
+ANTHROPIC_API_KEY=ollama
+MODEL_ID=qwen3-coder:30b
+```
+
+Then run any session script:
+
+```sh
+python agents/s01_agent_loop.py
+python agents/s05_skill_loading.py
+python agents/s13_personal_time_management.py
+```
+
 ### Web Platform
 
 Interactive visualizations, step-through diagrams, source viewer, and documentation.
