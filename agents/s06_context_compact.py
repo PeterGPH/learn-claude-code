@@ -35,14 +35,16 @@ Key insight: "The agent can forget strategically and keep working forever."
 
 import json
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
 
-from anthropic import Anthropic
+from anthropic import APIConnectionError, Anthropic, AnthropicError, BadRequestError
 from dotenv import load_dotenv
 
-load_dotenv(override=True)
+# Keep shell-exported vars authoritative; only fill missing values from .env.
+load_dotenv(override=False)
 
 if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
@@ -104,15 +106,20 @@ def auto_compact(messages: list) -> list:
     print(f"[transcript saved: {transcript_path}]")
     # Ask LLM to summarize
     conversation_text = json.dumps(messages, default=str)[:80000]
-    response = client.messages.create(
-        model=MODEL,
+    response = call_messages_api(
+        system="You summarize coding-agent conversations for continuity.",
         messages=[{"role": "user", "content":
             "Summarize this conversation for continuity. Include: "
             "1) What was accomplished, 2) Current state, 3) Key decisions made. "
             "Be concise but preserve critical details.\n\n" + conversation_text}],
+        tools=None,
         max_tokens=2000,
     )
-    summary = response.content[0].text
+    summary = (
+        "".join(block.text for block in response.content if hasattr(block, "text")).strip()
+        if response is not None
+        else "Summary unavailable (API error). Transcript was saved for recovery."
+    )
     # Replace all messages with compressed summary
     return [
         {"role": "user", "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}"},
@@ -191,6 +198,73 @@ TOOLS = [
 ]
 
 
+def extract_text_tool_calls(content_blocks):
+    """
+    Fallback parser for models that emit pseudo tool calls as plain text, e.g.:
+    <function=read_file><parameter=path>requirements.txt</parameter></function></tool_call>
+    """
+    texts = []
+    for block in content_blocks:
+        if hasattr(block, "type") and block.type == "text" and hasattr(block, "text"):
+            texts.append(block.text)
+    joined = "\n".join(texts)
+    calls = []
+    call_pattern = re.compile(
+        r"<function=([a-zA-Z0-9_]+)>\s*(.*?)\s*</function>\s*</tool_call>",
+        re.IGNORECASE | re.DOTALL,
+    )
+    param_pattern = re.compile(
+        r"<parameter=([a-zA-Z0-9_]+)>\s*(.*?)\s*</parameter>",
+        re.IGNORECASE | re.DOTALL,
+    )
+    for name, body in call_pattern.findall(joined):
+        args = {}
+        for key, value in param_pattern.findall(body):
+            raw = value.strip()
+            args[key] = int(raw) if key == "limit" and raw.isdigit() else raw
+        calls.append((name, args))
+    return calls
+
+
+def call_messages_api(system: str, messages: list, tools=None, max_tokens: int = 8000):
+    kwargs = {
+        "model": MODEL,
+        "system": system,
+        "messages": messages,
+        "max_tokens": max_tokens,
+    }
+    if tools is not None:
+        kwargs["tools"] = tools
+    try:
+        return client.messages.create(**kwargs)
+    except BadRequestError as e:
+        msg = str(e)
+        print(f"\033[31mBad request to Anthropic-compatible API:\033[0m {msg}")
+        if "model" in msg.lower() and "not found" in msg.lower():
+            base_url = os.getenv("ANTHROPIC_BASE_URL") or "https://api.anthropic.com"
+            print(f"Configured MODEL_ID={MODEL}")
+            print(f"Configured ANTHROPIC_BASE_URL={base_url}")
+            print("For Ollama, set MODEL_ID to an installed local tag, e.g. qwen3-coder:30b")
+        return None
+    except APIConnectionError as e:
+        print(f"\033[31mNetwork/API connection error:\033[0m {e}")
+        return None
+    except AnthropicError as e:
+        print(f"\033[31mAnthropic API error:\033[0m {e}")
+        return None
+
+
+def execute_tool(name: str, args: dict) -> tuple[str, bool]:
+    if name == "compact":
+        return "Compressing...", True
+    handler = TOOL_HANDLERS.get(name)
+    try:
+        output = handler(**args) if handler else f"Unknown tool: {name}"
+    except Exception as e:
+        output = f"Error: {e}"
+    return str(output), False
+
+
 def agent_loop(messages: list):
     while True:
         # Layer 1: micro_compact before each LLM call
@@ -199,30 +273,49 @@ def agent_loop(messages: list):
         if estimate_tokens(messages) > THRESHOLD:
             print("[auto_compact triggered]")
             messages[:] = auto_compact(messages)
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
-        )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        response = call_messages_api(SYSTEM, messages, TOOLS, 8000)
+        if response is None:
             return
-        results = []
+        messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason == "tool_use":
+            results = []
+            manual_compact = False
+            for block in response.content:
+                if block.type == "tool_use":
+                    output, should_compact = execute_tool(block.name, block.input)
+                    manual_compact = manual_compact or should_compact
+                    print(f"> {block.name}: {output[:200]}")
+                    results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
+            messages.append({"role": "user", "content": results})
+            # Layer 3: manual compact triggered by the compact tool
+            if manual_compact:
+                print("[manual compact]")
+                messages[:] = auto_compact(messages)
+            continue
+
+        # Fallback for models that return text-style function calls.
+        text_calls = extract_text_tool_calls(response.content)
+        if not text_calls:
+            return
+
+        feedback_lines = []
         manual_compact = False
-        for block in response.content:
-            if block.type == "tool_use":
-                if block.name == "compact":
-                    manual_compact = True
-                    output = "Compressing..."
-                else:
-                    handler = TOOL_HANDLERS.get(block.name)
-                    try:
-                        output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                    except Exception as e:
-                        output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
-        messages.append({"role": "user", "content": results})
-        # Layer 3: manual compact triggered by the compact tool
+        for name, args in text_calls:
+            output, should_compact = execute_tool(name, args)
+            manual_compact = manual_compact or should_compact
+            print(f"> {name}: {output[:200]}")
+            args_preview = ", ".join(f"{k}={v!r}" for k, v in args.items())
+            feedback_lines.append(f"{name}({args_preview}) -> {output}")
+
+        messages.append({
+            "role": "user",
+            "content": (
+                "Tool execution results:\n\n"
+                + "\n\n".join(feedback_lines)
+                + "\n\nIf finished, provide a concise final answer. "
+                "If more actions are needed, emit another function call."
+            ),
+        })
         if manual_compact:
             print("[manual compact]")
             messages[:] = auto_compact(messages)

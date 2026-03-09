@@ -44,15 +44,17 @@ Key insight: "Teammates that can talk to each other."
 
 import json
 import os
+import re
 import subprocess
 import threading
 import time
 from pathlib import Path
 
-from anthropic import Anthropic
+from anthropic import APIConnectionError, Anthropic, AnthropicError, BadRequestError
 from dotenv import load_dotenv
 
-load_dotenv(override=True)
+# Keep shell-exported vars authoritative; only fill missing values from .env.
+load_dotenv(override=False)
 if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
@@ -71,6 +73,60 @@ VALID_MSG_TYPES = {
     "shutdown_response",
     "plan_approval_response",
 }
+
+
+def extract_text_tool_calls(content_blocks):
+    """
+    Fallback parser for models that emit pseudo tool calls as plain text, e.g.:
+    <function=send_message><parameter=to>alice</parameter><parameter=content>hi</parameter></function></tool_call>
+    """
+    texts = []
+    for block in content_blocks:
+        if hasattr(block, "type") and block.type == "text" and hasattr(block, "text"):
+            texts.append(block.text)
+    joined = "\n".join(texts)
+    calls = []
+    call_pattern = re.compile(
+        r"<function=([a-zA-Z0-9_]+)>\s*(.*?)\s*</function>\s*</tool_call>",
+        re.IGNORECASE | re.DOTALL,
+    )
+    param_pattern = re.compile(
+        r"<parameter=([a-zA-Z0-9_]+)>\s*(.*?)\s*</parameter>",
+        re.IGNORECASE | re.DOTALL,
+    )
+    for name, body in call_pattern.findall(joined):
+        args = {}
+        for key, value in param_pattern.findall(body):
+            raw = value.strip()
+            args[key] = int(raw) if key == "limit" and raw.isdigit() else raw
+        calls.append((name, args))
+    return calls
+
+
+def call_messages_api(system: str, messages: list, tools: list, actor: str = "agent"):
+    try:
+        return client.messages.create(
+            model=MODEL,
+            system=system,
+            messages=messages,
+            tools=tools,
+            max_tokens=8000,
+        )
+    except BadRequestError as e:
+        msg = str(e)
+        print(f"\033[31m[{actor}] Bad request to Anthropic-compatible API:\033[0m {msg}")
+        if "model" in msg.lower() and "not found" in msg.lower():
+            base_url = os.getenv("ANTHROPIC_BASE_URL") or "https://api.anthropic.com"
+            print(f"Configured MODEL_ID={MODEL}")
+            print(f"Configured ANTHROPIC_BASE_URL={base_url}")
+            print("For Ollama, set MODEL_ID to an installed local tag, e.g. qwen3-coder:30b")
+        return None
+    except APIConnectionError as e:
+        print(f"\033[31m[{actor}] Network/API connection error:\033[0m {e}")
+        return None
+    except AnthropicError as e:
+        print(f"\033[31m[{actor}] Anthropic API error:\033[0m {e}")
+        return None
 
 
 # -- MessageBus: JSONL inbox per teammate --
@@ -173,30 +229,48 @@ class TeammateManager:
             inbox = BUS.read_inbox(name)
             for msg in inbox:
                 messages.append({"role": "user", "content": json.dumps(msg)})
-            try:
-                response = client.messages.create(
-                    model=MODEL,
-                    system=sys_prompt,
-                    messages=messages,
-                    tools=tools,
-                    max_tokens=8000,
-                )
-            except Exception:
+            response = call_messages_api(
+                system=sys_prompt,
+                messages=messages,
+                tools=tools,
+                actor=f"teammate:{name}",
+            )
+            if response is None:
                 break
             messages.append({"role": "assistant", "content": response.content})
-            if response.stop_reason != "tool_use":
+            if response.stop_reason == "tool_use":
+                results = []
+                for block in response.content:
+                    if block.type == "tool_use":
+                        output = self._exec(name, block.name, block.input)
+                        print(f"  [{name}] {block.name}: {str(output)[:120]}")
+                        results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": str(output),
+                        })
+                messages.append({"role": "user", "content": results})
+                continue
+
+            # Fallback for models that return text-style function calls.
+            text_calls = extract_text_tool_calls(response.content)
+            if not text_calls:
                 break
-            results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    output = self._exec(name, block.name, block.input)
-                    print(f"  [{name}] {block.name}: {str(output)[:120]}")
-                    results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": str(output),
-                    })
-            messages.append({"role": "user", "content": results})
+            feedback_lines = []
+            for tool_name, args in text_calls:
+                output = self._exec(name, tool_name, args)
+                print(f"  [{name}] {tool_name}: {str(output)[:120]}")
+                args_preview = ", ".join(f"{k}={v!r}" for k, v in args.items())
+                feedback_lines.append(f"{tool_name}({args_preview}) -> {output}")
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Tool execution results:\n\n"
+                    + "\n\n".join(feedback_lines)
+                    + "\n\nIf finished, provide a concise final answer. "
+                    "If more actions are needed, emit another function call."
+                ),
+            })
         member = self._find_member(name)
         if member and member["status"] != "shutdown":
             member["status"] = "idle"
@@ -353,31 +427,58 @@ def agent_loop(messages: list):
                 "role": "assistant",
                 "content": "Noted inbox messages.",
             })
-        response = client.messages.create(
-            model=MODEL,
+        response = call_messages_api(
             system=SYSTEM,
             messages=messages,
             tools=TOOLS,
-            max_tokens=8000,
+            actor="lead",
         )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        if response is None:
             return
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                try:
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                except Exception as e:
-                    output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": str(output),
-                })
-        messages.append({"role": "user", "content": results})
+        messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason == "tool_use":
+            results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    handler = TOOL_HANDLERS.get(block.name)
+                    try:
+                        output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                    except Exception as e:
+                        output = f"Error: {e}"
+                    print(f"> {block.name}: {str(output)[:200]}")
+                    results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": str(output),
+                    })
+            messages.append({"role": "user", "content": results})
+            continue
+
+        # Fallback for models that return text-style function calls.
+        text_calls = extract_text_tool_calls(response.content)
+        if not text_calls:
+            return
+
+        feedback_lines = []
+        for tool_name, args in text_calls:
+            handler = TOOL_HANDLERS.get(tool_name)
+            try:
+                output = handler(**args) if handler else f"Unknown tool: {tool_name}"
+            except Exception as e:
+                output = f"Error: {e}"
+            print(f"> {tool_name}: {str(output)[:200]}")
+            args_preview = ", ".join(f"{k}={v!r}" for k, v in args.items())
+            feedback_lines.append(f"{tool_name}({args_preview}) -> {output}")
+
+        messages.append({
+            "role": "user",
+            "content": (
+                "Tool execution results:\n\n"
+                + "\n\n".join(feedback_lines)
+                + "\n\nIf finished, provide a concise final answer. "
+                "If more actions are needed, emit another function call."
+            ),
+        })
 
 
 if __name__ == "__main__":

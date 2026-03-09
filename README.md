@@ -1,5 +1,18 @@
 [English](./README.md) | [中文](./README-zh.md) | [日本語](./README-ja.md)  
 # Learn Claude Code -- A nano Claude Code-like agent, built from 0 to 1
+
+## Attribution
+
+This project is a modified fork/adaptation of
+[shareAI-lab/learn-claude-code](https://github.com/shareAI-lab/learn-claude-code).
+
+I extended it with:
+- local Ollama + `qwen3-coder:30b` workflow
+- provider compatibility updates across `agents/*`
+- `s13_personal_time_management.py` (daily todo/progress/summary flow)
+
+Original project credit goes to the Learn Claude Code authors.
+
 <img width="260" src="https://github.com/user-attachments/assets/fe8b852b-97da-4061-a467-9694906b5edf" /><br>
 
 Scan with Wechat to fellow us,  
@@ -25,7 +38,7 @@ or fellow on X: [shareAI-Lab](https://x.com/baicai003)
     Production agents add policy, permissions, and lifecycle layers.
 ```
 
-**12 progressive sessions, from a simple loop to isolated autonomous execution.**
+**13 progressive sessions, from a simple loop to isolated autonomous execution plus personal productivity automation.**
 **Each session adds one mechanism. Each mechanism has one motto.**
 
 > **s01** &nbsp; *"One loop & Bash is all you need"* &mdash; one tool + one loop = an agent
@@ -51,6 +64,8 @@ or fellow on X: [shareAI-Lab](https://x.com/baicai003)
 > **s11** &nbsp; *"Teammates scan the board and claim tasks themselves"* &mdash; no need for the lead to assign each one
 >
 > **s12** &nbsp; *"Each works in its own directory, no interference"* &mdash; tasks manage goals, worktrees manage directories, bound by ID
+>
+> **s13** &nbsp; *"Turn tasks into daily execution and reflection"* &mdash; sync todos, log progress, and generate end-of-day summaries
 
 ---
 
@@ -102,11 +117,40 @@ Treat the team JSONL mailbox protocol in this repo as a teaching implementation,
 git clone https://github.com/shareAI-lab/learn-claude-code
 cd learn-claude-code
 pip install -r requirements.txt
-cp .env.example .env   # Edit .env with your ANTHROPIC_API_KEY
+cp .env.example .env   # Configure provider/model (Anthropic or Ollama)
 
 python agents/s01_agent_loop.py       # Start here
 python agents/s12_worktree_task_isolation.py  # Full progression endpoint
+python agents/s13_personal_time_management.py # Personal time-management workflow
 python agents/s_full.py               # Capstone: all mechanisms combined
+```
+
+### Local Ollama + Qwen (recommended for local runs)
+
+The `agents/*.py` scripts support Anthropic-compatible local endpoints, including Ollama.
+
+```sh
+# 1) Start local model
+ollama run qwen3-coder:30b
+
+# 2) Configure environment
+cp .env.example .env
+```
+
+Set `.env` to:
+
+```env
+ANTHROPIC_BASE_URL=http://localhost:11434/v1
+ANTHROPIC_API_KEY=ollama
+MODEL_ID=qwen3-coder:30b
+```
+
+Then run any session script:
+
+```sh
+python agents/s01_agent_loop.py
+python agents/s05_skill_loading.py
+python agents/s13_personal_time_management.py
 ```
 
 ### Web Platform
@@ -148,6 +192,11 @@ s08  Background Tasks        [6]     s10  Team Protocols          [12]
                                      s12  Worktree Isolation      [16]
                                           task coordination + optional isolated execution lanes
 
+Phase 5: PERSONAL EXECUTION
+===========================
+s13  Personal Time Mgmt     [9]
+     todo sync + progress logs + daily summaries
+
                                      [N] = number of tools
 ```
 
@@ -156,11 +205,11 @@ s08  Background Tasks        [6]     s10  Team Protocols          [12]
 ```
 learn-claude-code/
 |
-|-- agents/                        # Python reference implementations (s01-s12 + s_full capstone)
+|-- agents/                        # Python reference implementations (s01-s13 + s_full capstone)
 |-- docs/{en,zh,ja}/               # Mental-model-first documentation (3 languages)
 |-- web/                           # Interactive learning platform (Next.js)
 |-- skills/                        # Skill files for s05
-+-- .github/workflows/ci.yml      # CI: typecheck + build
++-- .github/workflows/*.yml       # CI: web build + agent syntax checks
 ```
 
 ## Documentation
@@ -182,10 +231,11 @@ Available in [English](./docs/en/) | [中文](./docs/zh/) | [日本語](./docs/j
 | [s10](./docs/en/s10-team-protocols.md) | Team Protocols | *Teammates need shared communication rules* |
 | [s11](./docs/en/s11-autonomous-agents.md) | Autonomous Agents | *Teammates scan the board and claim tasks themselves* |
 | [s12](./docs/en/s12-worktree-task-isolation.md) | Worktree + Task Isolation | *Each works in its own directory, no interference* |
+| [s13](./docs/en/s13-personal-time-management.md) | Personal Time Management | *Turn tasks into daily execution and reflection* |
 
 ## What's Next -- from understanding to shipping
 
-After the 12 sessions you understand how an agent works inside out. Two ways to put that knowledge to work:
+After the 13 sessions you understand how an agent works inside out. Two ways to put that knowledge to work:
 
 ### Kode Agent CLI -- Open-Source Coding Agent CLI
 
